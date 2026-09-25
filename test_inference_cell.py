@@ -4,7 +4,7 @@
 # Paste this as the LAST cell of amazon_ml_entity_resolution_pipeline_colab_3.ipynb and run it in the
 # SAME Colab session that trained the reranker. It reproduces the validated pipeline on the test set:
 #   bge-m3 dense top-400 (exact search, same country only)  +  lexical IDF top-200 (same country only)
-#   -> Reciprocal Rank Fusion -> top-20 from S2 + top-20 from S3 per entity (=40) = candidate_pairs.tsv
+#   -> Reciprocal Rank Fusion -> top-30 per entity, S2 and S3 combined = candidate_pairs.tsv
 #   -> fine-tuned bge-reranker-v2-m3 -> score >= best threshold (0.90) -> one-to-one resolution
 #   -> matching_results.tsv, validated against every rule in the problem statement.
 # Every expensive step saves to Drive (test_work/) and resumes if the cell is re-run.
@@ -26,9 +26,8 @@ BIENCODER_BASE = _g.get("BIENCODER_BASE", "BAAI/bge-m3")
 MAX_SEQ_LENGTH = _g.get("MAX_SEQ_LENGTH", 96)
 ENCODE_BATCH_SIZE = _g.get("ENCODE_BATCH_SIZE", 256)
 TOP_K_PER_SOURCE = _g.get("TOP_K_PER_SOURCE", 50)
-FINAL_K = _g.get("RERANK_PREFILTER_K", 15)          # used only when CANDS_PER_SOURCE is None
-CANDS_PER_SOURCE = 20       # top-20 from S2 + top-20 from S3 per entity (by RRF score) = 40 candidates,
-                            # all reranked. Set to None for the validated setting: top-15 overall (S2+S3 mixed).
+FINAL_K = 30                # candidates per entity: top-30 by RRF score, S2 and S3 combined, all reranked
+CANDS_PER_SOURCE = None     # None = top FINAL_K overall (simple). A number N instead takes N from S2 + N from S3.
 LEXICAL_MAX_DOC_FREQ_FRAC = _g.get("LEXICAL_MAX_DOC_FREQ_FRAC", 0.02)
 RRF_K = _g.get("RRF_K", 60)
 USE_HYBRID_RETRIEVAL = _g.get("USE_HYBRID_RETRIEVAL", True)
