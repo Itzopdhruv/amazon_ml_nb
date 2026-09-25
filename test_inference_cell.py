@@ -137,13 +137,14 @@ log(f"test: S1={len(t1):,}  S2={len(t2):,}  S3={len(t3):,}")
 for c in sorted(set(S1_CTRY)):
     log(f"   {c:>8}: S1={(S1_CTRY == c).sum():,}  S2+S3={(C_CTRY == c).sum():,}")
 
-# ---------------- 3. bge-m3 embeddings (fp16, chunked, cached to Drive) ----------------
+# ---------------- 3. bge-m3 embeddings (fp16, chunked; cached on Drive + fast local copy) ----------------
 def _emb_paths(src, n):
     return [f"{WORK_T}/emb/{src}_{i:04d}.npy" for i in range(math.ceil(n / EMB_CHUNK))]
 
 def embed(src, texts):
     paths = _emb_paths(src, len(texts))
-    t0 = time.time()
+    todo = [i for i, p in enumerate(paths) if not os.path.exists(p)]
+    t0, done = time.time(), 0
     for i, p in enumerate(paths):
         local = f"{LOCAL_DIR}/test_emb/{os.path.basename(p)}"
         if os.path.exists(p):
@@ -156,7 +157,10 @@ def embed(src, texts):
                                 show_progress_bar=False, convert_to_numpy=True).astype(np.float16)
         _save_npy(local, E)
         shutil.copy(local, p + ".tmp"); os.replace(p + ".tmp", p)
-        log(f"  embedded {src} chunk {i + 1}/{len(paths)} ({(i + 1) * EMB_CHUNK / (time.time() - t0):,.0f} rows/s)")
+        done += len(chunk)
+        left = sum(min(EMB_CHUNK, len(texts) - j * EMB_CHUNK) for j in todo if j > i)
+        rate = done / (time.time() - t0)
+        log(f"  embedded {src} chunk {i + 1}/{len(paths)} | {rate:,.0f} rows/s | ETA {left / rate / 60:.0f} min")
     return [f"{LOCAL_DIR}/test_emb/{os.path.basename(p)}" for p in paths]
 
 EMB_S1 = embed("s1", S1_TEXT)
@@ -169,22 +173,26 @@ gc.collect()
 
 # ---------------- 4. candidate generation (exact dense + lexical, RRF, top FINAL_K) ----------------
 cand_path = f"{WORK_T}/candidates.npz"
-if os.path.exists(cand_path):
-    with np.load(cand_path) as z:
-        CAND_IDX, CAND_RRF = z["idx"], z["rrf"]
-    log(f"loaded cached candidates {CAND_IDX.shape}")
-else:
-    n_q = len(S1_IDS)
-    ctry_codes = {c: i for i, c in enumerate(sorted(set(S1_CTRY) | set(C_CTRY)))}
-    q_cc = np.array([ctry_codes[c] for c in S1_CTRY], np.int32)
-    c_cc = np.array([ctry_codes[c] for c in C_CTRY], np.int32)
-    dtype = torch.float16 if DEVICE == "cuda" else torch.float32
+n_q = len(S1_IDS)
+_codes = {c: i for i, c in enumerate(sorted(set(S1_CTRY) | set(C_CTRY)))}
+q_cc = np.array([_codes[c] for c in S1_CTRY], np.int32)
+c_cc = np.array([_codes[c] for c in C_CTRY], np.int32)
+_code_name = {i: c for c, i in _codes.items()}
 
-    # ---- 4a. exact dense top-DENSE_K per query, same country only (streams the corpus chunk by chunk) ----
+# ---- 4a. exact dense top-DENSE_K per query, same country only (streams the corpus chunk by chunk) ----
+dense_path = f"{WORK_T}/dense_idx.npy"
+if os.path.exists(cand_path):
+    pass
+elif os.path.exists(dense_path):
+    DENSE_IDX = np.load(dense_path)
+    log("loaded cached dense results")
+else:
+    dtype = torch.float16 if DEVICE == "cuda" else torch.float32
     t0 = time.time()
-    DENSE_IDX = np.full((n_q, DENSE_K), -1, np.int64)
+    DENSE_IDX = np.full((n_q, DENSE_K), -1, np.int32)
     group = max(1, int(2.5e9 // (DENSE_K * 12)))             # queries per pass, keeps top-K buffers ~2.5 GB
     Q_ALL = np.concatenate([np.load(p) for p in EMB_S1])
+    qb = 2048
     for g0 in range(0, n_q, group):
         g_rows = np.arange(g0, min(n_q, g0 + group))
         Q = torch.from_numpy(Q_ALL[g_rows]).to(DEVICE, dtype)
@@ -200,7 +208,7 @@ else:
                     continue
                 Ec = torch.from_numpy(E[cm]).to(DEVICE, dtype)
                 gidx = torch.from_numpy(start + cm).to(DEVICE)
-                qb, b = 2048, 0
+                b = 0
                 while b < len(q_idx):
                     qi = q_idx[b:b + qb]
                     try:
@@ -219,60 +227,113 @@ else:
                     S = None
                 del Ec, gidx
             del E
-        DENSE_IDX[g_rows] = best_i.cpu().numpy()
+        DENSE_IDX[g_rows] = best_i.cpu().numpy().astype(np.int32)
         del Q, best_s, best_i
         if DEVICE == "cuda":
             torch.cuda.empty_cache()
-        log(f"  dense search: {g_rows[-1] + 1:,}/{n_q:,} queries ({time.time() - t0:.0f}s)")
+        el = time.time() - t0
+        log(f"  dense search: {g_rows[-1] + 1:,}/{n_q:,} queries | ETA {el / (g_rows[-1] + 1) * (n_q - g_rows[-1] - 1) / 60:.0f} min")
     del Q_ALL
+    _save_npy(dense_path, DENSE_IDX)
+    log("dense results saved")
 
-    # ---- 4b. lexical IDF retrieval, identical scoring to Cell 10/11 (sum of idf * tf over the query's
-    #          distinct tokens; tokens in more than LEXICAL_MAX_DOC_FREQ_FRAC of the country's corpus dropped) ----
-    LEX_IDX = np.full((n_q, LEX_K), -1, np.int64)
-    if USE_HYBRID_RETRIEVAL:
-        t0 = time.time()
-        for cc in np.unique(q_cc):
-            q_rows = np.nonzero(q_cc == cc)[0]
-            c_rows = np.nonzero(c_cc == cc)[0]
-            if len(c_rows) == 0:
+# ---- 4b. lexical IDF retrieval, identical scoring to Cell 10/11: sum of idf*tf over the query's distinct
+#          tokens; tokens in more than LEXICAL_MAX_DOC_FREQ_FRAC of the country's corpus are dropped.
+#          Runs on all CPU cores; results saved per segment so a disconnect loses at most one segment. ----
+import multiprocessing as mp
+LEX_QBLOCK = 128           # queries per sparse product (bounds per-worker memory)
+LEX_SEGMENT = 100_000      # queries per saved segment (resume granularity)
+os.makedirs(f"{WORK_T}/lex", exist_ok=True)
+_LEX = {}
+
+def _lex_block(b0):
+    rows = _LEX["rows"][b0:b0 + LEX_QBLOCK]
+    SC = ((_LEX["qcv"].transform(S1_TEXT[rows]) @ _LEX["idf"]) @ _LEX["DT"]).tocsr()   # queries x docs
+    out = np.full((len(rows), LEX_K), -1, np.int32)
+    for r in range(SC.shape[0]):
+        lo, hi = SC.indptr[r], SC.indptr[r + 1]
+        if lo == hi:
+            continue
+        d, j = SC.data[lo:hi], SC.indices[lo:hi]
+        if len(d) > LEX_K:
+            top = np.argpartition(-d, LEX_K - 1)[:LEX_K]
+            d, j = d[top], j[top]
+        o = np.argsort(-d, kind="stable")
+        out[r, :len(o)] = _LEX["c_rows"][j[o]]
+    return b0, out
+
+if USE_HYBRID_RETRIEVAL and not os.path.exists(cand_path):
+    LEX_IDX = np.full((n_q, LEX_K), -1, np.int32)
+    n_workers = max(1, (os.cpu_count() or 2) - 1)
+    t0 = time.time()
+    for cc in np.unique(q_cc):
+        name = _code_name[int(cc)]
+        q_rows = np.nonzero(q_cc == cc)[0]
+        c_rows = np.nonzero(c_cc == cc)[0]
+        segs = [(s0, f"{WORK_T}/lex/{name}_{s0 // LEX_SEGMENT:04d}.npy") for s0 in range(0, len(q_rows), LEX_SEGMENT)]
+        if len(c_rows) == 0 or all(os.path.exists(sp) for _, sp in segs):
+            for s0, sp in segs:
+                if os.path.exists(sp):
+                    LEX_IDX[q_rows[s0:s0 + LEX_SEGMENT]] = np.load(sp)
+            continue
+        log(f"  lexical index for {name}: {len(c_rows):,} docs ...")
+        cv = CountVectorizer(tokenizer=str.split, token_pattern=None, lowercase=False, dtype=np.float32)
+        D = cv.fit_transform(C_TEXT[c_rows]).tocsr()                  # docs x vocab, term frequencies
+        df_ = np.bincount(D.indices, minlength=D.shape[1])             # document frequency per token
+        keep = np.nonzero(df_ <= max(1, int(len(c_rows) * LEXICAL_MAX_DOC_FREQ_FRAC)))[0]
+        feats = cv.get_feature_names_out()
+        _LEX.clear()
+        _LEX.update(
+            rows=None, c_rows=c_rows.astype(np.int32),
+            DT=D[:, keep].T.tocsr(),                                   # kept vocab x docs
+            idf=sparse.diags(np.log1p(len(c_rows) / df_[keep]).astype(np.float32)),
+            qcv=CountVectorizer(tokenizer=str.split, token_pattern=None, lowercase=False, binary=True,
+                                vocabulary={t: i for i, t in enumerate(feats[keep])}, dtype=np.float32),
+        )
+        del D, cv, feats
+        gc.collect()
+        log(f"  {name}: kept {len(keep):,} tokens (df <= {LEXICAL_MAX_DOC_FREQ_FRAC:.0%}), {n_workers} workers")
+        for s0, sp in segs:
+            seg_rows = q_rows[s0:s0 + LEX_SEGMENT]
+            if os.path.exists(sp):
+                LEX_IDX[seg_rows] = np.load(sp)
                 continue
-            cv = CountVectorizer(tokenizer=str.split, token_pattern=None, lowercase=False, dtype=np.float32)
-            D = cv.fit_transform(C_TEXT[c_rows])                         # docs x vocab, term frequencies
-            df_ = np.asarray((D > 0).sum(0)).ravel()
-            keep = np.nonzero(df_ <= max(1, int(len(c_rows) * LEXICAL_MAX_DOC_FREQ_FRAC)))[0]
-            idf = np.log1p(len(c_rows) / df_[keep]).astype(np.float32)
-            DT = D[:, keep].T.tocsr()                                    # vocab_kept x docs
-            qcv = CountVectorizer(tokenizer=str.split, token_pattern=None, lowercase=False, binary=True,
-                                  vocabulary=cv.vocabulary_, dtype=np.float32)
-            for b0 in range(0, len(q_rows), 256):             # small blocks keep the sparse product bounded
-                rows = q_rows[b0:b0 + 256]
-                Qw = qcv.transform(S1_TEXT[rows])[:, keep] @ sparse.diags(idf)
-                SC = (Qw @ DT).tocsr()                                   # queries x docs
-                for r in range(SC.shape[0]):
-                    lo, hi = SC.indptr[r], SC.indptr[r + 1]
-                    if lo == hi:
-                        continue
-                    d, j = SC.data[lo:hi], SC.indices[lo:hi]
-                    if len(d) > LEX_K:
-                        top = np.argpartition(-d, LEX_K - 1)[:LEX_K]
-                        d, j = d[top], j[top]
-                    o = np.argsort(-d, kind="stable")
-                    LEX_IDX[rows[r], :len(o)] = c_rows[j[o]]
-            del D, DT, cv, qcv
-            gc.collect()
-            log(f"  lexical search country {cc}: {len(q_rows):,} queries vs {len(c_rows):,} docs ({time.time() - t0:.0f}s)")
+            _LEX["rows"] = seg_rows
+            seg_out = np.full((len(seg_rows), LEX_K), -1, np.int32)
+            starts = range(0, len(seg_rows), LEX_QBLOCK)
+            try:
+                with mp.get_context("fork").Pool(n_workers) as pool:
+                    for b0, out in pool.imap_unordered(_lex_block, starts, chunksize=4):
+                        seg_out[b0:b0 + len(out)] = out
+            except Exception as e:                                     # fall back to a single process
+                log(f"  parallel lexical search failed ({type(e).__name__}: {e}); running single-process")
+                for b0 in starts:
+                    _, out = _lex_block(b0)
+                    seg_out[b0:b0 + len(out)] = out
+            _save_npy(sp, seg_out)
+            LEX_IDX[seg_rows] = seg_out
+            done = s0 + len(seg_rows)
+            log(f"  lexical {name}: {done:,}/{len(q_rows):,} queries ({(time.time() - t0) / 60:.0f} min so far)")
+        _LEX.clear()
+        gc.collect()
 
-    # ---- 4c. Reciprocal Rank Fusion -> top FINAL_K per query (vectorized) ----
+# ---- 4c. Reciprocal Rank Fusion -> top FINAL_K per query (vectorized) ----
+if os.path.exists(cand_path):
+    with np.load(cand_path) as z:
+        CAND_IDX, CAND_RRF = z["idx"], z["rrf"]
+    log(f"loaded cached candidates {CAND_IDX.shape}")
+else:
     CAND_IDX = np.full((n_q, FINAL_K), -1, np.int64)
     CAND_RRF = np.zeros((n_q, FINAL_K), np.float32)
     N_C = len(C_IDS)
-    for b0 in range(0, n_q, 200_000):
-        sl = slice(b0, min(n_q, b0 + 200_000))
+    RB = 50_000
+    for b0 in range(0, n_q, RB):
+        sl = slice(b0, min(n_q, b0 + RB))
         lists = [DENSE_IDX[sl]] + ([LEX_IDX[sl]] if USE_HYBRID_RETRIEVAL else [])
         qs, cs, ws = [], [], []
         for L in lists:
             r, k = np.nonzero(L >= 0)
-            qs.append(r); cs.append(L[r, k]); ws.append(1.0 / (RRF_K + k + 1))
+            qs.append(r); cs.append(L[r, k].astype(np.int64)); ws.append(1.0 / (RRF_K + k + 1))
         q_, c_, w_ = np.concatenate(qs), np.concatenate(cs), np.concatenate(ws)
         key = q_.astype(np.int64) * N_C + c_
         uk, inv = np.unique(key, return_inverse=True)
@@ -285,7 +346,7 @@ else:
         m = rank < FINAL_K
         CAND_IDX[b0 + uq[m], rank[m]] = uc[m]
         CAND_RRF[b0 + uq[m], rank[m]] = score[m]
-    del DENSE_IDX, LEX_IDX
+    DENSE_IDX = LEX_IDX = None
     gc.collect()
     np.savez(cand_path + ".tmp.npz", idx=CAND_IDX, rrf=CAND_RRF)
     os.replace(cand_path + ".tmp.npz", cand_path)
@@ -344,7 +405,9 @@ for c in range(n_chunks):
     _save_npy(p, s)
     done += len(s)
     rate = done / (time.time() - t0)
-    log(f"  scored chunk {c + 1}/{n_chunks} | {rate:,.0f} pairs/s | ETA {max(0, len(qi) - (c + 1) * SCORE_CHUNK) / rate / 60:.0f} min")
+    left = sum(min(SCORE_CHUNK, len(qi) - j * SCORE_CHUNK) for j in range(c + 1, n_chunks)
+               if not os.path.exists(f"{score_dir}/chunk_{j:05d}.npy"))
+    log(f"  scored chunk {c + 1}/{n_chunks} | {rate:,.0f} pairs/s | ETA {left / rate / 60:.0f} min")
 SCORES = np.concatenate([np.load(f"{score_dir}/chunk_{c:05d}.npy") for c in range(n_chunks)]) if n_chunks else np.zeros(0, np.float32)
 
 # ---------------- 6. threshold + one-to-one resolution -> matching_results.tsv ----------------
