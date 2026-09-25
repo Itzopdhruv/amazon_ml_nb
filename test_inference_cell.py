@@ -24,7 +24,7 @@ MODE_TAG = _g.get("MODE_TAG", "dev")
 MODEL_DIR = _g.get("MODEL_DIR", f"{LOCAL_DIR}/models_{MODE_TAG}")
 BIENCODER_BASE = _g.get("BIENCODER_BASE", "BAAI/bge-m3")
 MAX_SEQ_LENGTH = _g.get("MAX_SEQ_LENGTH", 96)
-ENCODE_BATCH_SIZE = _g.get("ENCODE_BATCH_SIZE", 256)
+ENCODE_BATCH_SIZE = 512          # bigger batches: better GPU utilization (safe on L4/A100)
 TOP_K_PER_SOURCE = _g.get("TOP_K_PER_SOURCE", 50)
 FINAL_K = 30                # candidates per entity: top-30 by RRF score, S2 and S3 combined, all reranked
 CANDS_PER_SOURCE = None     # None = top FINAL_K overall (simple). A number N instead takes N from S2 + N from S3.
@@ -37,7 +37,7 @@ THRESHOLD = float(_g["best_t"]) if _g.get("best_t") is not None else 0.90   # fr
 # one-to-one resolution: follow what Cell 17 decided on validation; default ON (S1 is deduplicated,
 # so an S2/S3 record can belong to at most one S1 entity)
 USE_ONE_TO_ONE = bool(_g["f05_after"] >= _g["f05_before"]) if ("f05_after" in _g and "f05_before" in _g) else True
-SCORE_BATCH = 256
+SCORE_BATCH = 512                # auto-halves on OOM
 SCORE_CHUNK = 200_000        # pairs per saved score file (resume granularity)
 EMB_CHUNK = 200_000          # rows per saved embedding file (resume granularity)
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
