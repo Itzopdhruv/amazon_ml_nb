@@ -1,0 +1,11 @@
+# data / artifacts never belong in git (TSVs, indexes, checkpoints)
+*.tsv
+*.parquet
+*.faiss
+*.npy
+*.safetensors
+*.bin
+*.zip
+kaggle.json
+.ipynb_checkpoints/
+__pycache__/
