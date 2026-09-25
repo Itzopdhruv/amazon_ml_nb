@@ -12,7 +12,7 @@
 # Part B: writes one validated matching_results.tsv per setting into submission/variants/<name>/,
 #         so you can upload the best one first and try the others on the leaderboard.
 # ==================================================================================================
-import os, json, math, glob, shutil, time
+import os, json, glob
 import numpy as np
 import pandas as pd
 
@@ -100,12 +100,15 @@ else:
 if all(k in _g for k in ("qi", "pair_c", "SCORES", "S1_IDS", "C_IDS")) and len(_g["SCORES"]) == len(_g["qi"]):
     tq, tc, ts, T_S1, T_C = _g["qi"], _g["pair_c"], _g["SCORES"].astype(np.float64), _g["S1_IDS"], _g["C_IDS"]
 else:
-    with np.load(f"{WORK_T}/candidates.npz") as z:
+    cur = json.load(open(f"{WORK_T}/current.json")) if os.path.exists(f"{WORK_T}/current.json") else \
+        {"cand_path": f"{WORK_T}/candidates.npz", "score_dir": f"{WORK_T}/scores"}
+    print("using", cur)
+    with np.load(cur["cand_path"]) as z:
         cand = z["idx"]
     tq, kj = np.nonzero(cand >= 0)
     tc = cand[tq, kj]
-    n_chunks = len(glob.glob(f"{WORK_T}/scores/chunk_*.npy"))
-    ts = np.concatenate([np.load(f"{WORK_T}/scores/chunk_{i:05d}.npy") for i in range(n_chunks)]).astype(np.float64)
+    n_chunks = len(glob.glob(f"{cur['score_dir']}/chunk_*.npy"))
+    ts = np.concatenate([np.load(f"{cur['score_dir']}/chunk_{i:05d}.npy") for i in range(n_chunks)]).astype(np.float64)
     assert len(ts) == len(tq), "test scoring isn't finished yet: run test_inference_cell.py to the end first"
     T_S1 = pd.read_parquet(f"{WORK_T}/test_s1_prep.parquet", columns=["entity_id"])["entity_id"].values
     T_C = np.concatenate([pd.read_parquet(f"{WORK_T}/test_s{k}_prep.parquet", columns=["entity_id"])["entity_id"].values

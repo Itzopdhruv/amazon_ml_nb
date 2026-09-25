@@ -4,12 +4,12 @@
 # Paste this as the LAST cell of amazon_ml_entity_resolution_pipeline_colab_3.ipynb and run it in the
 # SAME Colab session that trained the reranker. It reproduces the validated pipeline on the test set:
 #   bge-m3 dense top-400 (exact search, same country only)  +  lexical IDF top-200 (same country only)
-#   -> Reciprocal Rank Fusion -> top RERANK_PREFILTER_K (=15) = candidate_pairs.tsv
+#   -> Reciprocal Rank Fusion -> top-20 from S2 + top-20 from S3 per entity (=40) = candidate_pairs.tsv
 #   -> fine-tuned bge-reranker-v2-m3 -> score >= best threshold (0.90) -> one-to-one resolution
 #   -> matching_results.tsv, validated against every rule in the problem statement.
 # Every expensive step saves to Drive (test_work/) and resumes if the cell is re-run.
 # ==================================================================================================
-import os, gc, json, math, time, shutil, hashlib, unicodedata, re
+import os, gc, json, math, time, shutil, hashlib, unicodedata, re, glob
 import numpy as np
 import pandas as pd
 import torch
@@ -26,7 +26,9 @@ BIENCODER_BASE = _g.get("BIENCODER_BASE", "BAAI/bge-m3")
 MAX_SEQ_LENGTH = _g.get("MAX_SEQ_LENGTH", 96)
 ENCODE_BATCH_SIZE = _g.get("ENCODE_BATCH_SIZE", 256)
 TOP_K_PER_SOURCE = _g.get("TOP_K_PER_SOURCE", 50)
-FINAL_K = _g.get("RERANK_PREFILTER_K", 15)                        # candidates per entity = candidate_pairs.tsv
+FINAL_K = _g.get("RERANK_PREFILTER_K", 15)          # used only when CANDS_PER_SOURCE is None
+CANDS_PER_SOURCE = 20       # top-20 from S2 + top-20 from S3 per entity (by RRF score) = 40 candidates,
+                            # all reranked. Set to None for the validated setting: top-15 overall (S2+S3 mixed).
 LEXICAL_MAX_DOC_FREQ_FRAC = _g.get("LEXICAL_MAX_DOC_FREQ_FRAC", 0.02)
 RRF_K = _g.get("RRF_K", 60)
 USE_HYBRID_RETRIEVAL = _g.get("USE_HYBRID_RETRIEVAL", True)
@@ -171,8 +173,13 @@ assert C_CHUNK_START[-1] + np.load(EMB_C[-1], mmap_mode="r").shape[0] == len(C_I
 del t2, t3
 gc.collect()
 
-# ---------------- 4. candidate generation (exact dense + lexical, RRF, top FINAL_K) ----------------
-cand_path = f"{WORK_T}/candidates.npz"
+# ---------------- 4. candidate generation (exact dense + lexical, RRF, then top-K) ----------------
+CAND_TAG = f"s2x{CANDS_PER_SOURCE}_s3x{CANDS_PER_SOURCE}" if CANDS_PER_SOURCE else f"top{FINAL_K}"
+CAND_W = 2 * CANDS_PER_SOURCE if CANDS_PER_SOURCE else FINAL_K     # candidate slots per entity
+# each candidate setting has its own cache files (top15 keeps the original names from earlier runs)
+cand_path = f"{WORK_T}/candidates.npz" if CAND_TAG == "top15" else f"{WORK_T}/candidates_{CAND_TAG}.npz"
+score_dir = f"{WORK_T}/scores" if CAND_TAG == "top15" else f"{WORK_T}/scores_{CAND_TAG}"
+log(f"candidate setting: {CAND_TAG} ({CAND_W} per entity)")
 n_q = len(S1_IDS)
 _codes = {c: i for i, c in enumerate(sorted(set(S1_CTRY) | set(C_CTRY)))}
 q_cc = np.array([_codes[c] for c in S1_CTRY], np.int32)
@@ -317,14 +324,14 @@ if USE_HYBRID_RETRIEVAL and not os.path.exists(cand_path):
         _LEX.clear()
         gc.collect()
 
-# ---- 4c. Reciprocal Rank Fusion -> top FINAL_K per query (vectorized) ----
+# ---- 4c. Reciprocal Rank Fusion -> top-K per query (per source, or overall), vectorized ----
 if os.path.exists(cand_path):
     with np.load(cand_path) as z:
         CAND_IDX, CAND_RRF = z["idx"], z["rrf"]
     log(f"loaded cached candidates {CAND_IDX.shape}")
 else:
-    CAND_IDX = np.full((n_q, FINAL_K), -1, np.int64)
-    CAND_RRF = np.zeros((n_q, FINAL_K), np.float32)
+    CAND_IDX = np.full((n_q, CAND_W), -1, np.int64)
+    CAND_RRF = np.zeros((n_q, CAND_W), np.float32)
     N_C = len(C_IDS)
     RB = 50_000
     for b0 in range(0, n_q, RB):
@@ -339,13 +346,22 @@ else:
         uk, inv = np.unique(key, return_inverse=True)
         score = np.bincount(inv, weights=w_)
         uq, uc = uk // N_C, uk % N_C
-        order = np.lexsort((-score, uq))                                  # by query, then score desc
-        uq, uc, score = uq[order], uc[order], score[order]
-        first = np.searchsorted(uq, uq, side="left")
-        rank = np.arange(len(uq)) - first
-        m = rank < FINAL_K
-        CAND_IDX[b0 + uq[m], rank[m]] = uc[m]
-        CAND_RRF[b0 + uq[m], rank[m]] = score[m]
+        if CANDS_PER_SOURCE:
+            src = (uc >= N_S2).astype(np.int64)                           # 0 = S2, 1 = S3
+            order = np.lexsort((-score, src, uq))                         # by query, source, score desc
+            uq, uc, score, src = uq[order], uc[order], score[order], src[order]
+            grp = uq * 2 + src
+            rank = np.arange(len(grp)) - np.searchsorted(grp, grp, side="left")
+            m = rank < CANDS_PER_SOURCE
+            col = src[m] * CANDS_PER_SOURCE + rank[m]                     # S2 in cols 0..19, S3 in 20..39
+        else:
+            order = np.lexsort((-score, uq))                              # by query, then score desc
+            uq, uc, score = uq[order], uc[order], score[order]
+            rank = np.arange(len(uq)) - np.searchsorted(uq, uq, side="left")
+            m = rank < FINAL_K
+            col = rank[m]
+        CAND_IDX[b0 + uq[m], col] = uc[m]
+        CAND_RRF[b0 + uq[m], col] = score[m]
     DENSE_IDX = LEX_IDX = None
     gc.collect()
     np.savez(cand_path + ".tmp.npz", idx=CAND_IDX, rrf=CAND_RRF)
@@ -369,46 +385,91 @@ CAND_TSV = f"{OUT_DIR}/candidate_pairs.tsv"
 _write(CAND_TSV, "candidate_entity_ids", cand_lists)
 n_c = np.array([len(x) for x in cand_lists])
 log(f"candidate_pairs.tsv written: avg {n_c.mean():.1f} candidates/entity, {(n_c == 0).sum():,} entities with none")
+if CANDS_PER_SOURCE:
+    _n2 = ((CAND_IDX >= 0) & (CAND_IDX < N_S2)).sum(1)
+    log(f"   per entity: avg {_n2.mean():.1f} from S2, {(n_c - _n2).mean():.1f} from S3")
 
 # ---------------- 5. cross-encoder scoring (chunked, resumable) ----------------
 qi, kj = np.nonzero(CAND_IDX >= 0)
 pair_c = CAND_IDX[qi, kj]
 sig = hashlib.md5(qi.tobytes() + pair_c.tobytes()).hexdigest()
-score_dir = f"{WORK_T}/scores"
+os.makedirs(score_dir, exist_ok=True)
 meta_p = f"{score_dir}/meta.json"
 if os.path.exists(meta_p) and json.load(open(meta_p)).get("sig") != sig:
     log("candidates changed since last scoring run: clearing old scores")
     shutil.rmtree(score_dir); os.makedirs(score_dir)
 json.dump({"sig": sig, "n": int(len(qi))}, open(meta_p, "w"))
+N_C = len(C_IDS)
+
+def _known_scores():
+    """(sorted pair keys, scores) already computed under ANY other candidate setting, so they are
+    looked up instead of re-scored (top-15 overall is a subset of top-20 per source)."""
+    keys, vals = [], []
+    others = [(f"{WORK_T}/candidates.npz", f"{WORK_T}/scores")] + [
+        (cp, f"{WORK_T}/scores_{os.path.basename(cp)[len('candidates_'):-4]}")
+        for cp in glob.glob(f"{WORK_T}/candidates_*.npz")]
+    for cp, sd in others:
+        if sd == score_dir or not (os.path.exists(cp) and os.path.exists(f"{sd}/meta.json")):
+            continue
+        with np.load(cp) as z:
+            ci = z["idx"]
+        oq, ok_ = np.nonzero(ci >= 0)
+        oc = ci[oq, ok_]
+        if json.load(open(f"{sd}/meta.json")).get("sig") != hashlib.md5(oq.tobytes() + oc.tobytes()).hexdigest():
+            continue
+        okey = oq.astype(np.int64) * N_C + oc
+        for f in glob.glob(f"{sd}/chunk_*.npy"):
+            c0 = int(os.path.basename(f)[6:11]) * SCORE_CHUNK
+            v = np.load(f)
+            keys.append(okey[c0:c0 + len(v)]); vals.append(v)
+    if not keys:
+        return np.zeros(0, np.int64), np.zeros(0, np.float32)
+    k, v = np.concatenate(keys), np.concatenate(vals)
+    k, first = np.unique(k, return_index=True)
+    return k, v[first]
 
 n_chunks = math.ceil(len(qi) / SCORE_CHUNK)
-t0, done, bs = time.time(), 0, SCORE_BATCH
-for c in range(n_chunks):
+todo_chunks = [c for c in range(n_chunks) if not os.path.exists(f"{score_dir}/chunk_{c:05d}.npy")]
+KNOWN_K, KNOWN_V = _known_scores() if todo_chunks else (np.zeros(0, np.int64), np.zeros(0, np.float32))
+if len(KNOWN_K):
+    log(f"reusing {len(KNOWN_K):,} pair scores from earlier runs (no re-scoring needed for those)")
+pair_key = qi.astype(np.int64) * N_C + pair_c
+t0, done, reused, bs = time.time(), 0, 0, SCORE_BATCH
+for c in todo_chunks:
     p = f"{score_dir}/chunk_{c:05d}.npy"
-    if os.path.exists(p):
-        continue
     sl = slice(c * SCORE_CHUNK, (c + 1) * SCORE_CHUNK)
-    a, b = S1_TEXT[qi[sl]], C_TEXT[pair_c[sl]]
-    order = np.argsort(np.fromiter((len(x) + len(y) for x, y in zip(a, b)), np.int64, len(a)), kind="stable")
-    pairs = [(a[i], b[i]) for i in order]
-    while True:
-        try:
-            s_sorted = reranker.predict(pairs, batch_size=bs, activation_fn=torch.nn.Sigmoid(),
-                                        show_progress_bar=False, convert_to_numpy=True)
-            break
-        except torch.cuda.OutOfMemoryError:
-            torch.cuda.empty_cache()
-            bs = max(1, bs // 2)
-            log(f"  OOM while scoring, batch -> {bs}")
-    s = np.empty(len(order), np.float32)
-    s[order] = np.asarray(s_sorted, dtype=np.float32).reshape(-1)
+    s = np.full(len(pair_key[sl]), np.nan, np.float32)
+    if len(KNOWN_K):
+        pos = np.minimum(np.searchsorted(KNOWN_K, pair_key[sl]), len(KNOWN_K) - 1)
+        hit = KNOWN_K[pos] == pair_key[sl]
+        s[hit] = KNOWN_V[pos[hit]]
+        reused += int(hit.sum())
+    need = np.nonzero(np.isnan(s))[0]
+    if len(need):
+        a, b = S1_TEXT[qi[sl]][need], C_TEXT[pair_c[sl]][need]
+        order = np.argsort(np.fromiter((len(x) + len(y) for x, y in zip(a, b)), np.int64, len(a)), kind="stable")
+        pairs = [(a[i], b[i]) for i in order]
+        while True:
+            try:
+                s_sorted = reranker.predict(pairs, batch_size=bs, activation_fn=torch.nn.Sigmoid(),
+                                            show_progress_bar=False, convert_to_numpy=True)
+                break
+            except torch.cuda.OutOfMemoryError:
+                torch.cuda.empty_cache()
+                bs = max(1, bs // 2)
+                log(f"  OOM while scoring, batch -> {bs}")
+        tmp = np.empty(len(order), np.float32)
+        tmp[order] = np.asarray(s_sorted, dtype=np.float32).reshape(-1)
+        s[need] = tmp
+        done += len(need)
+    assert not np.isnan(s).any()
     _save_npy(p, s)
-    done += len(s)
-    rate = done / (time.time() - t0)
-    left = sum(min(SCORE_CHUNK, len(qi) - j * SCORE_CHUNK) for j in range(c + 1, n_chunks)
-               if not os.path.exists(f"{score_dir}/chunk_{j:05d}.npy"))
-    log(f"  scored chunk {c + 1}/{n_chunks} | {rate:,.0f} pairs/s | ETA {left / rate / 60:.0f} min")
+    rate = done / max(time.time() - t0, 1e-9)
+    left = sum(min(SCORE_CHUNK, len(qi) - j * SCORE_CHUNK) for j in todo_chunks if j > c)
+    eta = f"ETA {left / rate / 60:.0f} min" if done else "ETA -"
+    log(f"  scored chunk {c + 1}/{n_chunks} | {rate:,.0f} new pairs/s | reused {reused:,} so far | {eta}")
 SCORES = np.concatenate([np.load(f"{score_dir}/chunk_{c:05d}.npy") for c in range(n_chunks)]) if n_chunks else np.zeros(0, np.float32)
+json.dump({"cand_path": cand_path, "score_dir": score_dir, "tag": CAND_TAG}, open(f"{WORK_T}/current.json", "w"))
 
 # ---------------- 6. threshold + one-to-one resolution -> matching_results.tsv ----------------
 keep = SCORES >= THRESHOLD
